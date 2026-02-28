@@ -1,0 +1,22 @@
+[project]
+name = "cfmmc-crawler"
+version = "0.1.0"
+description = "Crawler for downloading CFMMC settlement reports"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "beautifulsoup4",
+    "ddddocr==1.5.6",
+    "lxml",
+    "numpy==1.26.4",
+    "onnxruntime==1.17.3",
+    "pillow",
+    "requests",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = false
