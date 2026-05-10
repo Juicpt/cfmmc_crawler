@@ -4,7 +4,9 @@ import importlib
 import json
 import os
 import re
+import tempfile
 from collections.abc import Sequence
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 from requests import Session, session
@@ -25,24 +27,24 @@ class CFMMCCrawler(object):
     logout_url = base_url + "/logout.do"
     data_url = base_url + "/customer/setParameter.do"
     excel_daily_download_url = (
-        base_url + "/customer/setupViewCustomerDetailFromCompanyWithExcel.do"
+            base_url + "/customer/setupViewCustomerDetailFromCompanyWithExcel.do"
     )
     excel_monthly_download_url = (
-        base_url + "/customer/setupViewCustomerMonthDetailFromCompanyWithExcel.do"
+            base_url + "/customer/setupViewCustomerMonthDetailFromCompanyWithExcel.do"
     )
     trade_date_list_url = base_url + "/script/tradeDateList.js"
     header = {
         "Connection": "keep-alive",
-        "User-Agent": "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/72.0.3626.121 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
     }
     query_type_dict = {"逐日": "day", "逐笔": "trade"}
 
     def __init__(
-        self,
-        account_no: str,
-        password: str,
-        output_dir: str,
-        non_trading_days: Sequence[str] | None = None,
+            self,
+            account_no: str,
+            password: str,
+            output_dir: str,
+            non_trading_days: Sequence[str] | None = None,
     ) -> None:
         """
         从期货保证金结算中心下载期货结算单到本地
@@ -80,7 +82,7 @@ class CFMMCCrawler(object):
         return days
 
     def _load_non_trading_days(
-        self, fallback_non_trading_days: Sequence[str] | None
+            self, fallback_non_trading_days: Sequence[str] | None
     ) -> set[dt.date]:
         day_strings: Sequence[str]
         try:
@@ -103,13 +105,15 @@ class CFMMCCrawler(object):
             raise VerificationCodeError("验证码识别结果为空")
         return verification_code
 
-    @staticmethod
+    @classmethod
     def _parse_form_token_and_captcha_src(
-        page: str,
-        page_name: str,
-        require_captcha: bool,
-        use_body_form: bool,
-    ) -> tuple[str, str | None]:
+            cls,
+            page: str,
+            page_name: str,
+            require_captcha: bool,
+            use_body_form: bool,
+            require_token: bool,
+    ) -> tuple[str, str | None, str | None]:
         bs = BeautifulSoup(page, features="lxml")
         form_root = bs
         if use_body_form:
@@ -121,23 +125,35 @@ class CFMMCCrawler(object):
         if form is None:
             raise RuntimeError(f"{page_name}解析失败: 未找到 form")
 
-        token_input = form.input
+        form_action = form.get("action")
+        if not isinstance(form_action, str) or form_action == "":
+            raise RuntimeError(f"{page_name}解析失败: 未找到 form action")
+        action_url = urljoin(cls.base_url, form_action)
+
+        token_input = form.select_one(
+            'input[name="org.apache.struts.taglib.html.TOKEN"]'
+        )
+        token_value = None
         if token_input is None:
-            raise RuntimeError(f"{page_name}解析失败: 未找到 token input")
-        token_value = token_input.get("value")
-        if not isinstance(token_value, str) or token_value == "":
-            raise RuntimeError(f"{page_name}解析失败: token 无效")
+            if require_token:
+                raise RuntimeError(f"{page_name}解析失败: 未找到 token input")
+        else:
+            token_raw = token_input.get("value")
+            if isinstance(token_raw, str) and token_raw != "":
+                token_value = token_raw
+            elif require_token:
+                raise RuntimeError(f"{page_name}解析失败: token 无效")
 
         if not require_captcha:
-            return token_value, None
+            return action_url, token_value, None
 
-        captcha_img = form.img
+        captcha_img = form.select_one("img#imgVeriCode") or form.select_one("img")
         if captcha_img is None:
             raise RuntimeError(f"{page_name}解析失败: 未找到验证码图片")
         captcha_src = captcha_img.get("src")
         if not isinstance(captcha_src, str) or captcha_src == "":
             raise RuntimeError(f"{page_name}解析失败: 验证码地址无效")
-        return token_value, captcha_src
+        return action_url, token_value, captcha_src
 
     def login(self) -> None:
         """
@@ -147,8 +163,12 @@ class CFMMCCrawler(object):
         self._ss = session()
         ss = self._get_session()
         res = ss.get(self.login_url, headers=self.header)
-        token, captcha_src = self._parse_form_token_and_captcha_src(
-            res.text, "登录页", require_captcha=True, use_body_form=True
+        login_action_url, token, captcha_src = self._parse_form_token_and_captcha_src(
+            res.text,
+            "登录页",
+            require_captcha=True,
+            use_body_form=True,
+            require_token=False,
         )
         if captcha_src is None:
             raise RuntimeError("登录页解析失败: 验证码地址无效")
@@ -158,14 +178,15 @@ class CFMMCCrawler(object):
         print("验证码自动识别结果:", verification_code)
 
         post_data = {
-            "org.apache.struts.taglib.html.TOKEN": token,
             "showSaveCookies": "",
             "userID": self.account_no,
             "password": self.password,
             "vericode": verification_code,
         }
+        if token is not None:
+            post_data["org.apache.struts.taglib.html.TOKEN"] = token
         data_page = ss.post(
-            self.login_url, data=post_data, headers=self.header, timeout=5
+            login_action_url, data=post_data, headers=self.header, timeout=5
         )
 
         if "验证码错误" in data_page.text:
@@ -206,6 +227,9 @@ class CFMMCCrawler(object):
         file_name = self.account_no + "_" + trade_date + ".xls"
         full_path = os.path.join(path, file_name)
         os.makedirs(path, exist_ok=True)
+        if self._has_completed_download(full_path):
+            print("跳过已下载文件:", full_path)
+            return
 
         post_data = {
             "org.apache.struts.taglib.html.TOKEN": self.token,
@@ -234,6 +258,9 @@ class CFMMCCrawler(object):
         file_name = self.account_no + "_" + trade_date + ".xls"
         full_path = os.path.join(path, file_name)
         os.makedirs(path, exist_ok=True)
+        if self._has_completed_download(full_path):
+            print("跳过已下载文件:", full_path)
+            return
 
         post_data = {
             "org.apache.struts.taglib.html.TOKEN": self.token,
@@ -249,15 +276,58 @@ class CFMMCCrawler(object):
 
     @staticmethod
     def _get_token(page: str) -> str:
-        token, _ = CFMMCCrawler._parse_form_token_and_captcha_src(
-            page, "页面", require_captcha=False, use_body_form=False
+        _, token, _ = CFMMCCrawler._parse_form_token_and_captcha_src(
+            page,
+            "页面",
+            require_captcha=False,
+            use_body_form=False,
+            require_token=True,
         )
+        if token is None:
+            raise RuntimeError("页面解析失败: token 无效")
         return token
 
+    @staticmethod
+    def _has_completed_download(download_path: str) -> bool:
+        if not os.path.isfile(download_path):
+            return False
+        try:
+            return os.path.getsize(download_path) > 0
+        except OSError:
+            return False
+
+    @staticmethod
+    def _validate_download_response(content_type: str, content: bytes) -> None:
+        normalized_content_type = content_type.lower()
+        if "text/html" in normalized_content_type or "text/plain" in normalized_content_type:
+            raise RuntimeError(f"下载失败: 返回了非 Excel 内容 ({content_type})")
+        if not content:
+            raise RuntimeError("下载失败: 响应内容为空")
+
     def _download_file(self, web_address: str, download_path: str) -> None:
-        excel_response = self._get_session().get(web_address)
-        with open(download_path, "wb") as fh:
-            _ = fh.write(excel_response.content)
+        excel_response = self._get_session().get(web_address, timeout=(5, 1000))
+        excel_response.raise_for_status()
+        content = excel_response.content
+        if not content:
+            print("响应内容为空，跳过下载")
+            return
+        content_type = excel_response.headers.get("Content-Type", "")
+        self._validate_download_response(content_type, content)
+        temp_dir = os.path.dirname(download_path) or "."
+        temp_prefix = os.path.basename(download_path) + "."
+        fd, temp_path = tempfile.mkstemp(
+            dir=temp_dir,
+            prefix=temp_prefix,
+            suffix=".part",
+        )
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                _ = fh.write(content)
+            os.replace(temp_path, download_path)
+        except Exception:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
         print("下载 ", download_path, " 完成!")
 
     def get_trading_days(self, start_date: str, end_date: str) -> Sequence[dt.datetime]:
